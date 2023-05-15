@@ -24,9 +24,9 @@ import (
 
 	apiv1 "k8s.io/api/core/v1"
 
-	"k8s.io/ingress-nginx/internal/ingress"
 	"k8s.io/ingress-nginx/internal/ingress/defaults"
-	"k8s.io/ingress-nginx/internal/runtime"
+	"k8s.io/ingress-nginx/pkg/apis/ingress"
+	"k8s.io/ingress-nginx/pkg/util/runtime"
 )
 
 var (
@@ -263,6 +263,10 @@ type Configuration struct {
 	// Default: 4 8k
 	LargeClientHeaderBuffers string `json:"large-client-header-buffers"`
 
+	// Disable all escaping
+	// http://nginx.org/en/docs/http/ngx_http_log_module.html#log_format
+	LogFormatEscapeNone bool `json:"log-format-escape-none,omitempty"`
+
 	// Enable json escaping
 	// http://nginx.org/en/docs/http/ngx_http_log_module.html#log_format
 	LogFormatEscapeJSON bool `json:"log-format-escape-json,omitempty"`
@@ -434,6 +438,11 @@ type Configuration struct {
 	// Default: true
 	UseHTTP2 bool `json:"use-http2,omitempty"`
 
+	// Disables gzipping of responses for requests with "User-Agent" header fields matching any of
+	// the specified regular expressions.
+	// http://nginx.org/en/docs/http/ngx_http_gzip_module.html#gzip_disable
+	GzipDisable string `json:"gzip-disable,omitempty"`
+
 	// gzip Compression Level that will be used
 	GzipLevel int `json:"gzip-level,omitempty"`
 
@@ -558,6 +567,54 @@ type Configuration struct {
 	// If false, incoming span headers will be rejected
 	// Default: true
 	OpentracingTrustIncomingSpan bool `json:"opentracing-trust-incoming-span"`
+
+	// EnableOpentelemetry enables the nginx Opentelemetry extension
+	// By default this is disabled
+	EnableOpentelemetry bool `json:"enable-opentelemetry"`
+
+	// OpentelemetryConfig sets the opentelemetry config file
+	// Default: /etc/nginx/opentelemetry.toml
+	OpentelemetryConfig string `json:"opentelemetry-config"`
+
+	// OpentelemetryOperationName specifies a custom name for the server span
+	OpentelemetryOperationName string `json:"opentelemetry-operation-name"`
+
+	// OpentelemetryTrustIncomingSpan sets whether or not to trust incoming trace spans
+	// If false, incoming span headers will be rejected
+	// Default: true
+	OpentelemetryTrustIncomingSpan bool `json:"opentelemetry-trust-incoming-span"`
+
+	// OtlpCollectorHost specifies the host to use when uploading traces
+	OtlpCollectorHost string `json:"otlp-collector-host"`
+
+	// OtlpCollectorPort specifies the port to use when uploading traces
+	// Default: 4317
+	OtlpCollectorPort string `json:"otlp-collector-port"`
+
+	// OtelServiceName specifies the service name to use for any traces created
+	// Default: nginx
+	OtelServiceName string `json:"otel-service-name"`
+
+	// OtelSampler specifies the sampler to use for any traces created
+	// Default: AlwaysOff
+	OtelSampler string `json:"otel-sampler"`
+
+	// OtelSamplerRatio specifies the sampler ratio to use for any traces created
+	// Default: 0.01
+	OtelSamplerRatio float32 `json:"otel-sampler-ratio"`
+
+	//OtelSamplerParentBased specifies the parent based sampler to be use for any traces created
+	// Default: false
+	OtelSamplerParentBased bool `json:"otel-sampler-parent-based"`
+
+	// MaxQueueSize specifies the max queue size for uploading traces
+	OtelMaxQueueSize int32 `json:"otel-max-queuesize"`
+
+	// ScheduleDelayMillis specifies the max delay between uploading traces
+	OtelScheduleDelayMillis int32 `json:"otel-schedule-delay-millis"`
+
+	// MaxExportBatchSize specifies the max export batch size to used when uploading traces
+	OtelMaxExportBatchSize int32 `json:"otel-max-export-batch-size"`
 
 	// ZipkinCollectorHost specifies the host to use when uploading traces
 	ZipkinCollectorHost string `json:"zipkin-collector-host"`
@@ -768,6 +825,11 @@ type Configuration struct {
 	// GlobalRateLimitStatucCode determines the HTTP status code to return
 	// when limit is exceeding during global rate limiting.
 	GlobalRateLimitStatucCode int `json:"global-rate-limit-status-code"`
+
+	// DebugConnections Enables debugging log for selected client connections
+	// http://nginx.org/en/docs/ngx_core_module.html#debug_connection
+	// Default: ""
+	DebugConnections []string `json:"debug-connections"`
 }
 
 // NewDefault returns the default nginx configuration
@@ -782,10 +844,9 @@ func NewDefault() Configuration {
 	defNginxStatusIpv4Whitelist = append(defNginxStatusIpv4Whitelist, "127.0.0.1")
 	defNginxStatusIpv6Whitelist = append(defNginxStatusIpv6Whitelist, "::1")
 	defProxyDeadlineDuration := time.Duration(5) * time.Second
-	defGlobalExternalAuth := GlobalExternalAuth{"", "", "", "", "", append(defResponseHeaders, ""), "", "", "", []string{}, map[string]string{}}
+	defGlobalExternalAuth := GlobalExternalAuth{"", "", "", "", "", append(defResponseHeaders, ""), "", "", "", []string{}, map[string]string{}, false}
 
 	cfg := Configuration{
-
 		AllowSnippetAnnotations:          true,
 		AllowBackendServerHeader:         false,
 		AnnotationValueWordBlocklist:     "",
@@ -826,7 +887,7 @@ func NewDefault() Configuration {
 		GzipMinLength:                    256,
 		GzipTypes:                        gzipTypes,
 		KeepAlive:                        75,
-		KeepAliveRequests:                100,
+		KeepAliveRequests:                1000,
 		LargeClientHeaderBuffers:         "4 8k",
 		LogFormatEscapeJSON:              false,
 		LogFormatStream:                  logFormatStream,
@@ -886,6 +947,7 @@ func NewDefault() Configuration {
 			PreserveTrailingSlash:    false,
 			SSLRedirect:              true,
 			CustomHTTPErrors:         []int{},
+			DenylistSourceRange:      []string{},
 			WhitelistSourceRange:     []string{},
 			SkipAccessLogURLs:        []string{},
 			LimitRate:                0,
@@ -903,6 +965,13 @@ func NewDefault() Configuration {
 		BindAddressIpv4:                        defBindAddress,
 		BindAddressIpv6:                        defBindAddress,
 		OpentracingTrustIncomingSpan:           true,
+		OpentelemetryTrustIncomingSpan:         true,
+		OpentelemetryConfig:                    "/etc/nginx/opentelemetry.toml",
+		OtlpCollectorPort:                      "4317",
+		OtelServiceName:                        "nginx",
+		OtelSampler:                            "AlwaysOff",
+		OtelSamplerRatio:                       0.01,
+		OtelSamplerParentBased:                 false,
 		ZipkinCollectorPort:                    9411,
 		ZipkinServiceName:                      "nginx",
 		ZipkinSampleRate:                       1.0,
@@ -932,6 +1001,7 @@ func NewDefault() Configuration {
 		GlobalRateLimitMemcachedMaxIdleTimeout: 10000,
 		GlobalRateLimitMemcachedPoolSize:       50,
 		GlobalRateLimitStatucCode:              429,
+		DebugConnections:                       []string{},
 	}
 
 	if klog.V(5).Enabled() {
@@ -995,4 +1065,5 @@ type GlobalExternalAuth struct {
 	AuthCacheKey           string            `json:"authCacheKey"`
 	AuthCacheDuration      []string          `json:"authCacheDuration"`
 	ProxySetHeaders        map[string]string `json:"proxySetHeaders,omitempty"`
+	AlwaysSetCookie        bool              `json:"alwaysSetCookie,omitempty"`
 }

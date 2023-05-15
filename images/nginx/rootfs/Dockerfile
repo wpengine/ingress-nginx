@@ -11,17 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-FROM alpine:3.14.6 as builder
+FROM alpine:3.17.2 as builder
 
 COPY . /
 
 RUN apk update \
   && apk upgrade \
-  && apk add -U bash \
+  && apk add -U bash --no-cache \
   && /build.sh
 
 # Use a multi-stage build
-FROM alpine:3.14.6
+FROM alpine:3.17.2
 
 ENV PATH=$PATH:/usr/local/luajit/bin:/usr/local/nginx/sbin:/usr/local/nginx/bin
 
@@ -31,10 +31,8 @@ ENV LUA_CPATH="/usr/local/lib/lua/?/?.so;/usr/local/lib/lua/?.so;;"
 COPY --from=builder /usr/local /usr/local
 COPY --from=builder /opt /opt
 COPY --from=builder /etc/nginx /etc/nginx
-COPY --from=builder entrypoint.sh /usr/local/entrypoint.sh
 
-RUN chmod +x /usr/local/entrypoint.sh \
-  && apk update \
+RUN apk update \
   && apk upgrade \
   && apk add -U --no-cache \
   bash \
@@ -51,7 +49,6 @@ RUN chmod +x /usr/local/entrypoint.sh \
   libmaxminddb \
   yaml-cpp \
   dumb-init \
-  nano \
   tzdata \
   && ln -s /usr/local/nginx/sbin/nginx /sbin/nginx \
   && adduser -S -D -H -u 101 -h /usr/local/nginx \
@@ -72,7 +69,5 @@ RUN chmod +x /usr/local/entrypoint.sh \
   done'
 
 EXPOSE 80 443
-
-ENTRYPOINT ["/usr/local/entrypoint.sh"]
 
 CMD ["nginx", "-g", "daemon off;"]

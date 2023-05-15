@@ -28,7 +28,7 @@ import (
 	"k8s.io/ingress-nginx/internal/ingress/annotations/parser"
 	ing_errors "k8s.io/ingress-nginx/internal/ingress/errors"
 	"k8s.io/ingress-nginx/internal/ingress/resolver"
-	"k8s.io/ingress-nginx/internal/sets"
+	"k8s.io/ingress-nginx/pkg/util/sets"
 )
 
 // Config returns external authentication configuration for an Ingress rule
@@ -48,6 +48,7 @@ type Config struct {
 	KeepaliveRequests      int               `json:"keepaliveRequests"`
 	KeepaliveTimeout       int               `json:"keepaliveTimeout"`
 	ProxySetHeaders        map[string]string `json:"proxySetHeaders,omitempty"`
+	AlwaysSetCookie        bool              `json:"alwaysSetCookie,omitempty"`
 }
 
 // DefaultCacheDuration is the fallback value if no cache duration is provided
@@ -112,6 +113,10 @@ func (e1 *Config) Equal(e2 *Config) bool {
 		return false
 	}
 
+	if e1.AlwaysSetCookie != e2.AlwaysSetCookie {
+		return false
+	}
+
 	return sets.StringElementsMatch(e1.AuthCacheDuration, e2.AuthCacheDuration)
 }
 
@@ -144,7 +149,8 @@ func ValidHeader(header string) bool {
 // ValidCacheDuration checks if the provided string is a valid cache duration
 // spec: [code ...] [time ...];
 // with: code is an http status code
-//       time must match the time regex and may appear multiple times, e.g. `1h 30m`
+//
+//	time must match the time regex and may appear multiple times, e.g. `1h 30m`
 func ValidCacheDuration(duration string) bool {
 	elements := strings.Split(duration, " ")
 	seenDuration := false
@@ -297,6 +303,8 @@ func (a authReq) Parse(ing *networking.Ingress) (interface{}, error) {
 
 	requestRedirect, _ := parser.GetStringAnnotation("auth-request-redirect", ing)
 
+	alwaysSetCookie, _ := parser.GetBoolAnnotation("auth-always-set-cookie", ing)
+
 	return &Config{
 		URL:                    urlString,
 		Host:                   authURL.Hostname(),
@@ -312,6 +320,7 @@ func (a authReq) Parse(ing *networking.Ingress) (interface{}, error) {
 		KeepaliveRequests:      keepaliveRequests,
 		KeepaliveTimeout:       keepaliveTimeout,
 		ProxySetHeaders:        proxySetHeaders,
+		AlwaysSetCookie:        alwaysSetCookie,
 	}, nil
 }
 

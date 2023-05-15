@@ -21,10 +21,6 @@ load_module /etc/nginx/modules/ngx_http_brotli_filter_module.so;
 load_module /etc/nginx/modules/ngx_http_brotli_static_module.so;
 {{ end }}
 
-{{ if (shouldLoadInfluxDBModule $servers) }}
-load_module /etc/nginx/modules/ngx_http_influxdb_module.so;
-{{ end }}
-
 {{ if (shouldLoadAuthDigestModule $servers) }}
 load_module /etc/nginx/modules/ngx_http_auth_digest_module.so;
 {{ end }}
@@ -35,6 +31,10 @@ load_module /etc/nginx/modules/ngx_http_modsecurity_module.so;
 
 {{ if (shouldLoadOpentracingModule $cfg $servers) }}
 load_module /etc/nginx/modules/ngx_http_opentracing_module.so;
+{{ end }}
+
+{{ if (shouldLoadOpentelemetryModule $cfg $servers) }}
+load_module /modules_mount/etc/nginx/modules/otel/otel_ngx_module.so;
 {{ end }}
 
 daemon off;
@@ -58,9 +58,16 @@ events {
     multi_accept        {{ if $cfg.EnableMultiAccept }}on{{ else }}off{{ end }};
     worker_connections  {{ $cfg.MaxWorkerConnections }};
     use                 epoll;
+    {{ range $index , $v := $cfg.DebugConnections }}
+    debug_connection    {{ $v }};
+    {{ end }}
 }
 
 http {
+    {{ if (shouldLoadOpentelemetryModule $cfg $servers) }}
+    opentelemetry_config {{ $cfg.OpentelemetryConfig }};
+    {{ end }}
+
     lua_package_path "/etc/nginx/lua/?.lua;;";
 
     {{ buildLuaSharedDictionaries $cfg $servers }}
@@ -319,6 +326,7 @@ http {
     limit_conn_status               {{ $cfg.LimitConnStatusCode }};
 
     {{ buildOpentracing $cfg $servers }}
+    {{ buildOpentelemetry $cfg $servers }}
 
     include /etc/nginx/mime.types;
     default_type {{ $cfg.DefaultType }};
@@ -333,6 +341,9 @@ http {
     {{ if $cfg.UseGzip }}
     gzip on;
     gzip_comp_level {{ $cfg.GzipLevel }};
+    {{- if $cfg.GzipDisable }}
+    gzip_disable "{{ $cfg.GzipDisable }}";
+    {{- end }}
     gzip_http_version 1.1;
     gzip_min_length {{ $cfg.GzipMinLength}};
     gzip_types {{ $cfg.GzipTypes }};
@@ -358,7 +369,7 @@ http {
     # $ingress_name
     # $service_name
     # $service_port
-    log_format upstreaminfo {{ if $cfg.LogFormatEscapeJSON }}escape=json {{ end }}'{{ $cfg.LogFormatUpstream }}';
+    log_format upstreaminfo {{ if $cfg.LogFormatEscapeNone }}escape=none {{ else if $cfg.LogFormatEscapeJSON }}escape=json {{ end }}'{{ $cfg.LogFormatUpstream }}';
 
     {{/* map urls that should not appear in access.log */}}
     {{/* http://nginx.org/en/docs/http/ngx_http_log_module.html#access_log */}}
@@ -656,7 +667,7 @@ http {
         {{ $cfg.ServerSnippet }}
         {{ end }}
 
-        {{ template "CUSTOM_ERRORS" (buildCustomErrorDeps "upstream-default-backend" $cfg.CustomHTTPErrors $all.EnableMetrics) }}
+        {{ template "CUSTOM_ERRORS" (buildCustomErrorDeps "upstream-default-backend" $cfg.CustomHTTPErrors $all.EnableMetrics $cfg.EnableModsecurity) }}
     }
     ## end server {{ $server.Hostname }}
 
@@ -689,6 +700,9 @@ http {
         opentracing off;
         {{ end }}
 
+        {{ if $cfg.EnableOpentelemetry }}
+        opentelemetry off;
+        {{ end }}
         location {{ $healthzURI }} {
             return 200;
         }
@@ -733,6 +747,8 @@ stream {
     lua_package_path "/etc/nginx/lua/?.lua;/etc/nginx/lua/vendor/?.lua;;";
 
     lua_shared_dict tcp_udp_configuration_data 5M;
+    
+    {{ buildResolvers $cfg.Resolver $cfg.DisableIpv6DNS }}
 
     init_by_lua_block {
         collectgarbage("collect")
@@ -778,7 +794,7 @@ stream {
     access_log {{ or $cfg.StreamAccessLogPath $cfg.AccessLogPath }} log_stream {{ $cfg.AccessLogParams }};
     {{ end }}
 
-   
+
     error_log  {{ $cfg.ErrorLogPath }} {{ $cfg.ErrorLogLevel }};
     {{ if $cfg.EnableRealIp }}
     {{ range $trusted_ip := $cfg.ProxyRealIPCIDR }}
@@ -872,10 +888,16 @@ stream {
 {{/* definition of templates to avoid repetitions */}}
 {{ define "CUSTOM_ERRORS" }}
         {{ $enableMetrics := .EnableMetrics }}
+        {{ $modsecurityEnabled := .ModsecurityEnabled }}
         {{ $upstreamName := .UpstreamName }}
         {{ range $errCode := .ErrorCodes }}
         location @custom_{{ $upstreamName }}_{{ $errCode }} {
             internal;
+
+            # Ensure that modsecurity will not run on custom error pages or they might be blocked
+            {{ if $modsecurityEnabled }}
+            modsecurity off;
+            {{ end }}
 
             proxy_intercept_errors off;
 
@@ -887,6 +909,7 @@ stream {
             proxy_set_header       X-Service-Name     $service_name;
             proxy_set_header       X-Service-Port     $service_port;
             proxy_set_header       X-Request-ID       $req_id;
+            proxy_set_header       X-Forwarded-For    $remote_addr;
             proxy_set_header       Host               $best_http_host;
 
             set $proxy_upstream_name {{ $upstreamName | quote }};
@@ -947,7 +970,7 @@ stream {
         set $proxy_upstream_name "-";
 
         {{ if not ( empty $server.CertificateAuth.MatchCN ) }}
-        {{ if gt (len $server.CertificateAuth.MatchCN) 0 }}  
+        {{ if gt (len $server.CertificateAuth.MatchCN) 0 }}
         if ( $ssl_client_s_dn !~ {{ $server.CertificateAuth.MatchCN }} ) {
             return 403 "client certificate unauthorized";
         }
@@ -1015,7 +1038,7 @@ stream {
         {{ end }}
 
         {{ range $errorLocation := (buildCustomErrorLocationsPerServer $server) }}
-        {{ template "CUSTOM_ERRORS" (buildCustomErrorDeps $errorLocation.UpstreamName $errorLocation.Codes $all.EnableMetrics) }}
+        {{ template "CUSTOM_ERRORS" (buildCustomErrorDeps $errorLocation.UpstreamName $errorLocation.Codes $all.EnableMetrics $all.Cfg.EnableModsecurity) }}
         {{ end }}
 
         {{ buildMirrorLocations $server.Locations }}
@@ -1046,6 +1069,18 @@ stream {
             {{ if (or $all.Cfg.EnableOpentracing $location.Opentracing.Enabled) }}
             opentracing on;
             opentracing_propagate_context;
+            {{ end }}
+
+            {{ if (or $all.Cfg.EnableOpentelemetry $location.Opentelemetry.Enabled) }}
+            opentelemetry on;
+            opentelemetry_propagate;
+            {{ end }}
+
+            access_log off;
+
+            # Ensure that modsecurity will not run on an internal location as this is not accessible from outside
+            {{ if $all.Cfg.EnableModsecurity }}
+            modsecurity off;
             {{ end }}
 
             {{ if $externalAuth.AuthCacheKey }}
@@ -1158,6 +1193,15 @@ stream {
 
             add_header Set-Cookie $auth_cookie;
 
+            {{ if $location.CorsConfig.CorsEnabled }}
+            {{ template "CORS" $location }}
+            {{ end }}
+
+            # Ensure that modsecurity will not run on an internal location as this is not accessible from outside
+            {{ if $all.Cfg.EnableModsecurity }}
+            modsecurity off;
+            {{ end }}
+
             return 302 {{ buildAuthSignURL $externalAuth.SigninURL $externalAuth.SigninURLRedirectParam }};
         }
         {{ end }}
@@ -1173,6 +1217,7 @@ stream {
             set $global_rate_limit_exceeding n;
 
             {{ buildOpentracingForLocation $all.Cfg.EnableOpentracing $all.Cfg.OpentracingTrustIncomingSpan $location }}
+            {{ buildOpentelemetryForLocation $all.Cfg.EnableOpentelemetry $all.Cfg.OpentelemetryTrustIncomingSpan $location }}
 
             {{ if $location.Mirror.Source }}
             mirror {{ $location.Mirror.Source }};
@@ -1242,10 +1287,18 @@ stream {
             {{ buildModSecurityForLocation $all.Cfg $location }}
 
             {{ if isLocationAllowed $location }}
+            {{ if gt (len $location.Denylist.CIDR) 0 }}
+            {{ range $ip := $location.Denylist.CIDR }}
+            deny {{ $ip }};{{ end }}
+            {{ end }}
             {{ if gt (len $location.Whitelist.CIDR) 0 }}
             {{ range $ip := $location.Whitelist.CIDR }}
             allow {{ $ip }};{{ end }}
             deny all;
+            {{ end }}
+
+            {{ if $location.CorsConfig.CorsEnabled }}
+            {{ template "CORS" $location }}
             {{ end }}
 
             {{ if not (isLocationInLocationList $location $all.Cfg.NoAuthLocations) }}
@@ -1268,7 +1321,7 @@ stream {
                     {{- end }}
                     return
                 end
-                if res.status == ngx.HTTP_FORBIDDEN then
+                if res.status == ngx.HTTP_UNAUTHORIZED or res.status == ngx.HTTP_FORBIDDEN then
                     ngx.exit(res.status)
                 end
                 ngx.exit(ngx.HTTP_INTERNAL_SERVER_ERROR)
@@ -1276,7 +1329,11 @@ stream {
             {{ else }}
             auth_request        {{ $authPath }};
             auth_request_set    $auth_cookie $upstream_http_set_cookie;
+            {{ if $externalAuth.AlwaysSetCookie }}
+            add_header          Set-Cookie $auth_cookie always;
+            {{ else }}
             add_header          Set-Cookie $auth_cookie;
+            {{ end }}
             {{- range $line := buildAuthResponseHeaders $proxySetHeader $externalAuth.ResponseHeaders false }}
             {{ $line }}
             {{- end }}
@@ -1304,12 +1361,6 @@ stream {
             {{ $limits := buildRateLimit $location }}
             {{ range $limit := $limits }}
             {{ $limit }}{{ end }}
-
-            {{ if $location.CorsConfig.CorsEnabled }}
-            {{ template "CORS" $location }}
-            {{ end }}
-
-            {{ buildInfluxDB $location.InfluxDB }}
 
             {{ if isValidByteSize $location.Proxy.BodySize true }}
             client_max_body_size                    {{ $location.Proxy.BodySize }};
@@ -1481,6 +1532,10 @@ stream {
             opentracing off;
             {{ end }}
 
+            {{ if $all.Cfg.EnableOpentelemetry }}
+            opentelemetry off;
+            {{ end }}
+
             access_log off;
             return 200;
         }
@@ -1490,6 +1545,10 @@ stream {
         location /nginx_status {
             {{ if $all.Cfg.EnableOpentracing }}
             opentracing off;
+            {{ end }}
+
+            {{ if $all.Cfg.EnableOpentelemetry }}
+            opentelemetry off;
             {{ end }}
 
             {{ range $v := $all.NginxStatusIpv4Whitelist }}
